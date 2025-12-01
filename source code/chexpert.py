@@ -25,6 +25,7 @@ import numpy as np
 from tqdm.auto import tqdm
 import torchvision.models as models
 import timm
+from PIL import Image
 
 
 # parser = argparse.ArgumentParser(description='Train ResNet on Camera Traps dataset with consistency loss.')
@@ -66,40 +67,11 @@ valid_df = load_and_correct_paths(CSV_VALID_PATH)
 print(f"Train DataFrame loaded: {len(train_df)} rows")
 print(f"Valid DataFrame loaded: {len(valid_df)} rows")
 
-
-# --- 5. FINAL VERIFICATION (Image Test) ---
 print("\n--- 5. Final Image Verification Test ---")
 
-# Get the path of the first image in the validation DataFrame
 test_image_path = valid_df['Path'].iloc[0]
-print(test_image_path)
 
-try:
-    # Read the image (using grayscale for X-rays)
-    image = cv2.imread(test_image_path, cv2.IMREAD_GRAYSCALE)
-
-    if image is not None:
-        print(f"✅ SUCCESS: Image read from path: {test_image_path}")
-
-        # Display the image
-        plt.figure(figsize=(4, 4))
-        plt.imshow(image, cmap='gray')
-        plt.title("Data Test Passed!")
-        plt.axis('off')
-        plt.show()
-    else:
-        print("❌ ERROR: cv2.imread returned None. File may be corrupted or path is slightly off.")
-        # Check file details to see if it exists but is corrupted (e.g., 0 bytes)
-
-except FileNotFoundError:
-    print(f"❌ CRITICAL ERROR: File Not Found at path: {test_image_path}")
-    print(f"Path attempted: {test_image_path}")
-    print("Ensure the zip file contents exactly match the CSV paths (e.g., 'chexpert/train/...' exists).")
-
-print(f"\nTraining can begin using 'train_df' and 'valid_df'.")
-
-# 1. Transforms for CNN-based Models (ResNet, EfficientNet, ConvNeXt)
-# These models prefer smaller crop sizes and standard normalization.
+# cnn transforms, prefer different transforms than vit transforms
 cnn_transforms = transforms.Compose([
     transforms.Resize(256),         # Resize shortest side to 256
     transforms.CenterCrop(224),     # Crop to standard 224x224 input size
@@ -110,9 +82,6 @@ cnn_transforms = transforms.Compose([
     )
 ])
 
-# 2. Transforms for Vision Transformers (ViT, Swin)
-# Transformers often benefit from a slightly larger input size (e.g., 384x384)
-# and different augmentation strategies if trained from scratch.
 vit_transforms = transforms.Compose([
     transforms.Resize(256),         # Resize shortest side to 256
     transforms.CenterCrop(224),     # Crop to standard 224x224 input size
@@ -128,35 +97,25 @@ class CheXpertDataset(Dataset):
         self.df = dataframe
         self.transform = transform
 
-        # Select the 5 target labels for the CheXpert competition
         # baseline models benchmark against these five labels normally
         self.labels = ['Cardiomegaly', 'Edema', 'Consolidation', 'Atelectasis', 'Pleural Effusion']
 
-        # Handle Uncertainty: Replace all -1 (uncertain) labels with 1 (positive) or 0 (negative)
-        # Zero-imputation (-1 -> 0) is a common strategy
+        # handle uncertain labels
         self.df[self.labels] = self.df[self.labels].replace(-1, 0)
-        self.df[self.labels] = self.df[self.labels].fillna(0) # Fill NaN (Not Applicable) with 0
+        self.df[self.labels] = self.df[self.labels].fillna(0) 
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        # 1. Load Image from Corrected Absolute Path
+        # get image
         img_path = self.df.iloc[idx]['Path']
-
-        # Read the image in grayscale (0 is standard for X-ray)
-        # cv2.IMREAD_GRAYSCALE or 0
         image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
 
-        # Convert grayscale image to 3 channels by stacking (required by ImageNet pretraining)
+        # convert to rgb
         image = np.stack([image] * 3, axis=-1)
 
-        # Convert BGR (cv2 default) to RGB (not strictly necessary for grayscale, but safe practice)
-        # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # Removed as we read grayscale
-
-        # 2. Apply Transforms
-        # Convert NumPy array to PIL Image before applying transforms
-        from PIL import Image
+        
         image = Image.fromarray(image)
 
         if self.transform:
@@ -176,11 +135,6 @@ class CheXpertDataset(Dataset):
 SAMPLING_FRAC = 0.018
 
 AUG_ROOT_DIR = '/storage/project/r-smussmann3-0/aqin32/chexpert/train_augmented_n{N_AUGMENTATIONS}'
-
-if not os.path.isdir(AUG_ROOT_DIR):
-    print(f"CRITICAL WARNING: Augmented data directory not found at {AUG_ROOT_DIR}. Did you run the generation script?")
-
-# --- 1. Augmented Paths DataFrame Generation and Sampling ---
 
 def generate_augmented_paths_df(aug_root_dir: str) -> pd.DataFrame:
     """
@@ -216,12 +170,9 @@ if df_augmented_paths.empty:
 
 print(f"\nFull Augmented Paths DataFrame generated with {len(df_augmented_paths)} entries.")
 
-# --- Sampling Logic ---
-# Find all unique Original IDs
+# get sequencei ds
 unique_ids = df_augmented_paths['Original_ID'].unique()
 df_unique_ids = pd.DataFrame(unique_ids, columns=['Original_ID'])
-
-# Sample a fraction of these unique IDs
 sampled_unique_ids_df = df_unique_ids.sample(frac=SAMPLING_FRAC, random_state=42).reset_index(drop=True)
 sampled_ids_list = sampled_unique_ids_df['Original_ID'].tolist()
 
@@ -230,13 +181,11 @@ print(f"Total unique sequences found: {len(unique_ids)}")
 print(f"Sequences to be used: {len(sampled_ids_list)}")
 
 
-# --- 2. Runtime Transform ---
 runtime_transform = v2.Compose([
     v2.ToTensor(),
     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) 
 ])
 
-# --- 3. Custom Dataset Class (Modified to accept pre-sampled IDs) ---
 class SequenceDataset(Dataset):
     def __init__(self, aug_root_dir: str, original_ids_list: list[str], transform):
         """
@@ -251,27 +200,16 @@ class SequenceDataset(Dataset):
         return len(self.original_ids)
 
     def __getitem__(self, idx):
-        # 1. Get the pre-sampled original image identifier 
         original_id = self.original_ids[idx]
         id_dir = os.path.join(self.aug_root_dir, original_id)
-        
-        # 2. Load all augmented image paths for this original image
+    
         aug_files = sorted([os.path.join(id_dir, f) for f in os.listdir(id_dir) if f.endswith('.jpg')])
-        
-        # --- File Count Check (Still useful if the generation was interrupted) ---
-        if len(aug_files) != self.expected_n_aug:
-             print(f"🚨 DEBUG WARNING: ID {original_id} expected {self.expected_n_aug} files but found {len(aug_files)}. Loading found files.")
         
         sequence_tensors = []
         for file_path in aug_files:
-            try:
-                img = Image.open(file_path).convert('RGB')
-                tensor = self.transform(img)
-                sequence_tensors.append(tensor)
-            except Exception as e:
-                # Log the error but continue if other files exist
-                print(f"❌ DEBUG ERROR: Failed to load/transform file {file_path} for ID {original_id}. Error: {e}")
-                continue
+            img = Image.open(file_path).convert('RGB')
+            tensor = self.transform(img)
+            sequence_tensors.append(tensor)
             
         if not sequence_tensors:
              raise RuntimeError(f"CRITICAL ERROR: No valid images loaded for ID: {original_id}. Sequence skipped.")
@@ -280,7 +218,6 @@ class SequenceDataset(Dataset):
         
         return sequence_tensor, original_id
 
-# --- 4. Instantiate the Dataset and DataLoader ---
 
 sequence_dataset = SequenceDataset(
     AUG_ROOT_DIR,
@@ -304,11 +241,8 @@ print(f"\nAugmented Sequence DataLoader ready: {len(sequence_dataset)} sequences
 print(f"Sequence DataLoader batch size: {SEQ_BATCH_SIZE}")
     
 BATCH_SIZE = 64
-NUM_WORKERS = 4 # Use multiple workers for fast data loading on Colab CPU
+NUM_WORKERS = 4
 
-# -------------------------------------------------------------
-# MODULAR SETUP 1: For ResNet / EfficientNet (using cnn_transforms)
-# -------------------------------------------------------------
 print("Setting up data for CNN model...")
 # 0.022: 5000 images, 10%
 # 0.067: 15000 images, 30%
@@ -333,12 +267,6 @@ cnn_valid_loader = DataLoader(
     num_workers=NUM_WORKERS,
     pin_memory=True
 )
-print("CNN DataLoaders ready.")
-
-# -------------------------------------------------------------
-# MODULAR SETUP 2: For ViT / Swin Transformer (using vit_transforms)
-# -------------------------------------------------------------
-print("\nSetting up data for Transformer model...")
 
 vit_train_dataset = CheXpertDataset(train_df, transform=vit_transforms)
 vit_valid_dataset = CheXpertDataset(valid_df, transform=vit_transforms)
@@ -357,12 +285,6 @@ vit_valid_loader = DataLoader(
     num_workers=NUM_WORKERS,
     pin_memory=True
 )
-print("ViT DataLoaders ready.")
-
-
-available_coatnet_models = [m for m in timm.list_models() if 'coatnet' in m]
-print("Available CoAtNet models:")
-print(available_coatnet_models)
 
 num_classes = 5
 
@@ -386,7 +308,7 @@ print(f"ConvNeXt-Tiny loaded with {num_classes} outputs.")
 model_vit = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=num_classes)
 print(f"ViT-Base loaded with {num_classes} outputs.")
 
-# Swin Transformer (Swin-T) - Note: Default timm weights are often ImageNet-1k/22k
+# swim transformer
 model_swin = timm.create_model('swin_tiny_patch4_window7_224', pretrained=True, num_classes=num_classes)
 print(f"Swin-Tiny loaded with {num_classes} outputs.")
 
@@ -425,33 +347,24 @@ def high_confidence_consensus_vector(seq_outputs: torch.Tensor, confidence_thres
     pseudo_target = torch.full((num_classes,), -1.0, device=seq_outputs.device)
 
     for i in range(num_classes):
-        # Check if all T frames agree (all are 0 or all are 1)
+        # check if frames agree
         predictions_i = predictions[:, i] # [T]
         
-        # True if min == max (perfect agreement)
+        # agree if min equiv to max
         perfect_agreement = (predictions_i.min() == predictions_i.max())
 
         if perfect_agreement:
-            # 1. Consensus state (0 or 1)
             consensus_state = predictions_i[0].float() 
-            
-            # 2. Check Confidence: The agreement must be highly confident
-            # If the consensus is positive (1), check min probability of P(1)
             if consensus_state == 1.0:
                 min_confidence = probabilities[:, i].min()
                 if min_confidence >= confidence_threshold:
                     pseudo_target[i] = 1.0
             
-            # If the consensus is negative (0), check max probability of P(1) (should be low)
-            # This is equivalent to checking if min probability of P(0) is high (1 - max(P(1)) > threshold)
-            else: # consensus_state == 0.0
+            else:
                 max_uncertainty = probabilities[:, i].max()
                 if (1.0 - max_uncertainty) >= confidence_threshold:
                     pseudo_target[i] = 0.0
-        
-        # If agreement is not perfect, the label remains -1.0 (no consensus)
 
-    # Check if ANY label achieved consensus. If not, return a standard error signal.
     if torch.all(pseudo_target == -1.0):
         return torch.full((num_classes,), -1.0, device=seq_outputs.device)
         
@@ -472,33 +385,17 @@ def majority_vote_consensus_vector(seq_outputs: torch.Tensor, majority_threshold
     """
     num_classes = seq_outputs.size(1)
     T = seq_outputs.size(0)
-    
-    # [T, num_classes] probabilities
     probabilities = torch.sigmoid(seq_outputs) 
-
-    # [T, num_classes] binary predictions (0 or 1)
     predictions = (probabilities > 0.5).float() # Use float for easier summing
     
-    # Sum of positive votes for each class [num_classes]
     positive_votes = predictions.sum(dim=0)
-    
-    # Fraction of votes that were positive
-    positive_fraction = positive_votes / T # [num_classes]
-    
-    # Initialize the pseudo-target vector
+    positive_fraction = positive_votes / T 
     pseudo_target = torch.full((num_classes,), -1.0, device=seq_outputs.device)
-
-    # If the fraction of positive votes is >= threshold, the pseudo-label is 1.0
     is_positive = (positive_fraction >= majority_threshold)
-    
-    # If the fraction of negative votes (1 - positive_fraction) is >= threshold, the pseudo-label is 0.0
     is_negative = ((1.0 - positive_fraction) >= majority_threshold)
-    
-    # Assign the targets
+
     pseudo_target[is_positive] = 1.0
     pseudo_target[is_negative] = 0.0
-
-    # Note: If a label is between (1 - threshold) and threshold (e.g., 0.3 to 0.7), it remains -1.0
     
     return pseudo_target
 
@@ -516,20 +413,14 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
         learning_rate (float): Initial learning rate for the optimizer.
         checkpoint_dir (str): Persistent path to save best model weights.
     """
-    # 1. Setup Device and Components
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # BCEWithLogitsLoss is standard for multi-label classification
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-
-    # Scheduler reduces LR when validation loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
 
     best_val_auc = 0.0
-
-    # Ensure checkpoint directory exists
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     print(f"\n--- Starting Training: {model_name} on {device} ---")
@@ -539,8 +430,6 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
     confidence = 0.75
     for epoch in epoch_bar:
         epoch_start_time = time.time()
-
-        # --- TRAINING PHASE ---
         model.train()
         supervised_loss_sum = 0.0
         consistency_loss_sum = 0.0
@@ -572,28 +461,17 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
                 # for given batch stores how many sequences were confident
                 consistent_sequences = 0 
                 for i in range(batch_size):
-                    # Calculate the multi-label pseudo-target vector [5]
                     # pseudo_target_vector = high_confidence_consensus_vector(seq_outputs[i].detach(), confidence)
                     pseudo_target_vector = majority_vote_consensus_vector(seq_outputs[i].detach(), confidence)
                     
-                    # Check if consensus was reached for ANY label (if all are -1, skip)
+                    # if one of the predicted labels is viable
                     if not torch.all(pseudo_target_vector == -1.0): 
                         consistent_sequences += 1
-                        
-                        # Create a binary mask to select only the consensus labels
                         mask = (pseudo_target_vector != -1.0)
-                        
-                        # 1. Filter the current sequence outputs [T, num_classes] to only consensus labels
+                    
                         outputs_i_masked = seq_outputs[i][:, mask] # [T, num_consensus_classes]
-                        
-                        # 2. Filter the pseudo targets [num_classes] to only consensus labels
                         target_i_masked = pseudo_target_vector[mask] # [num_consensus_classes]
-                        
-                        # 3. Target vector is repeated for each of the T frames [T, num_consensus_classes]
                         targets_repeated = target_i_masked.unsqueeze(0).expand_as(outputs_i_masked)
-                        
-                        # 4. Calculate MSE loss between the outputs and the pseudo targets
-                        # Note: We use MSE here, which is standard for consistency loss on probabilities/logits.
                         loss = F.mse_loss(outputs_i_masked, targets_repeated, reduction='mean')
 
                         consistency_loss += loss
@@ -612,7 +490,6 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
         train_loss_consistency = consistency_loss_sum / len(seq_loader) if len(seq_loader) > 0 else 0.0
         train_loss = train_loss_supervised + train_loss_consistency
 
-        # --- VALIDATION PHASE ---
         model.eval()
         running_val_loss = 0.0
         all_targets = []
@@ -636,18 +513,15 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
         targets_np = np.concatenate(all_targets)
         predictions_np = np.concatenate(all_predictions)
 
-        # Calculate Mean AUC
         try:
             val_auc = roc_auc_score(targets_np, predictions_np, average='macro')
         except ValueError:
-            val_auc = 0.0 # Handle case where AUC cannot be computed (e.g., one class missing)
+            val_auc = 0.0
 
-        # Update Learning Rate Scheduler
         scheduler.step(val_loss)
 
         epoch_bar.set_postfix_str(f"Loss: {train_loss:.4f}, Val AUC: {val_auc:.4f}")
 
-        # --- Reporting and Checkpointing ---
         print(f"Epoch {epoch+1:02d}/{num_epochs} ({time.time() - epoch_start_time:.1f}s) | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
@@ -655,7 +529,6 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
-            # Save weights to the unique checkpoint path
             checkpoint_file = os.path.join(checkpoint_dir, f'{model_name}_best.pth')
             torch.save(model.state_dict(), checkpoint_file)
             print(f"       ✅ Model checkpoint saved! New Best AUC: {best_val_auc:.4f}")
@@ -666,51 +539,50 @@ def run_experiment(model, train_loader, seq_loader, valid_loader, model_name, nu
 
     return best_val_auc
 
-# Assuming you have loaded your models and data loaders:
-# model_resnet, model_vit, cnn_train_loader, vit_train_loader, etc.
+# cnn models
 
-# best_auc_resnet = run_experiment(
-#     model=model_resnet,
-#     train_loader=cnn_train_loader,
-#     seq_loader=seq_train_loader,
-#     valid_loader=cnn_valid_loader,
-#     model_name='ResNet50',
-#     num_epochs=30,
-#     learning_rate=5e-5 # Lower LR often better for fine-tuning
-# )
+best_auc_resnet = run_experiment(
+    model=model_resnet,
+    train_loader=cnn_train_loader,
+    seq_loader=seq_train_loader,
+    valid_loader=cnn_valid_loader,
+    model_name='ResNet50',
+    num_epochs=30,
+    learning_rate=5e-5 # Lower LR often better for fine-tuning
+)
 
-# best_auc_efficientnet = run_experiment(
-#     model=model_efficientnet,
-#     train_loader=cnn_train_loader,
-#     seq_loader=seq_train_loader,
-#     valid_loader=cnn_valid_loader,
+best_auc_efficientnet = run_experiment(
+    model=model_efficientnet,
+    train_loader=cnn_train_loader,
+    seq_loader=seq_train_loader,
+    valid_loader=cnn_valid_loader,
 
-#     model_name='EfficientNet-B0',
-#     num_epochs=30,
-#     learning_rate=5e-5 # Lower LR often better for fine-tuning
-# )
+    model_name='EfficientNet-B0',
+    num_epochs=30,
+    learning_rate=5e-5 # Lower LR often better for fine-tuning
+)
 
-# best_auc_convnext = run_experiment(
-#     model=model_convnext,
-#     train_loader=cnn_train_loader,
-#     seq_loader=seq_train_loader,
-#     valid_loader=cnn_valid_loader,
-#     model_name='convnext_tiny',
-#     num_epochs=30,
-#     learning_rate=5e-5 # Lower LR often better for fine-tuning
-# )
+best_auc_convnext = run_experiment(
+    model=model_convnext,
+    train_loader=cnn_train_loader,
+    seq_loader=seq_train_loader,
+    valid_loader=cnn_valid_loader,
+    model_name='convnext_tiny',
+    num_epochs=30,
+    learning_rate=5e-5 # Lower LR often better for fine-tuning
+)
 
-# best_auc_coatnext = run_experiment(
-#     model=model_coatnet,
-#     train_loader=cnn_train_loader,
-#     seq_loader=seq_train_loader,
-#     valid_loader=cnn_valid_loader,
-#     model_name='CoAtNet-0',
-#     num_epochs=30,
-#     learning_rate=5e-5 # Lower LR often better for fine-tuning
-# )
+best_auc_coatnext = run_experiment(
+    model=model_coatnet,
+    train_loader=cnn_train_loader,
+    seq_loader=seq_train_loader,
+    valid_loader=cnn_valid_loader,
+    model_name='CoAtNet-0',
+    num_epochs=30,
+    learning_rate=5e-5 # Lower LR often better for fine-tuning
+)
 
-# --- Experiment 2: ViT-Base (using ViT loaders with larger input) ---
+# transformer based models
 best_auc_vit = run_experiment(
     model=model_vit,
     train_loader=vit_train_loader,
